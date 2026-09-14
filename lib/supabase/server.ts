@@ -60,15 +60,19 @@ export async function searchProperties(filters: {
     try {
       let q = supabase.from('properties').select('*');
 
-      if (filters.state) q = q.ilike('state', `%${filters.state}%`);
-      if (filters.district) q = q.ilike('district', `%${filters.district}%`);
-      if (filters.tehsil) q = q.ilike('tehsil', `%${filters.tehsil}%`);
-      if (filters.village) q = q.ilike('village', `%${filters.village}%`);
-      if (filters.khasra) q = q.eq('khasra_number', filters.khasra);
+      if (filters.state) q = q.ilike('state', `%${filters.state.trim()}%`);
+      if (filters.district) q = q.ilike('district', `%${filters.district.trim()}%`);
+      if (filters.tehsil) q = q.ilike('tehsil', `%${filters.tehsil.trim()}%`);
+      if (filters.village) q = q.ilike('village', `%${filters.village.trim()}%`);
+      if (filters.khasra && filters.khasra.trim()) {
+        const cleanKh = filters.khasra.trim();
+        q = q.or(`khasra_number.eq.${cleanKh},survey_number.eq.${cleanKh}`);
+      }
 
-      if (filters.query) {
+      if (filters.query && filters.query.trim()) {
+        const cleanQ = filters.query.trim();
         q = q.or(
-          `property_id.ilike.%${filters.query}%,owner_name.ilike.%${filters.query}%,khasra_number.ilike.%${filters.query}%`
+          `property_id.ilike.%${cleanQ}%,owner_name.ilike.%${cleanQ}%,khasra_number.ilike.%${cleanQ}%,state.ilike.%${cleanQ}%,district.ilike.%${cleanQ}%`
         );
       }
 
@@ -83,19 +87,25 @@ export async function searchProperties(filters: {
 
   // Fallback to demo properties
   return DEMO_PROPERTIES.filter((p) => {
-    if (filters.state && !p.state.toLowerCase().includes(filters.state.toLowerCase())) return false;
-    if (filters.district && !p.district.toLowerCase().includes(filters.district.toLowerCase())) return false;
-    if (filters.tehsil && !p.tehsil.toLowerCase().includes(filters.tehsil.toLowerCase())) return false;
-    if (filters.village && !p.village.toLowerCase().includes(filters.village.toLowerCase())) return false;
-    if (filters.khasra && p.khasra_number !== filters.khasra && p.survey_number !== filters.khasra) return false;
+    if (filters.state && !p.state.toLowerCase().includes(filters.state.toLowerCase().trim())) return false;
+    if (filters.district && !p.district.toLowerCase().includes(filters.district.toLowerCase().trim())) return false;
+    if (filters.tehsil && !p.tehsil.toLowerCase().includes(filters.tehsil.toLowerCase().trim())) return false;
+    if (filters.village && !p.village.toLowerCase().includes(filters.village.toLowerCase().trim())) return false;
+    if (filters.khasra && filters.khasra.trim()) {
+      const kh = filters.khasra.trim().toLowerCase();
+      if (p.khasra_number.toLowerCase() !== kh && (!p.survey_number || p.survey_number.toLowerCase() !== kh)) return false;
+    }
 
     if (filters.query) {
-      const q = filters.query.toLowerCase();
+      const q = filters.query.toLowerCase().trim();
       const matchesId = p.property_id.toLowerCase().includes(q);
       const matchesOwner = p.owner_name.toLowerCase().includes(q);
       const matchesKhasra = p.khasra_number.toLowerCase().includes(q);
       const matchesVillage = p.village.toLowerCase().includes(q);
-      if (!matchesId && !matchesOwner && !matchesKhasra && !matchesVillage) return false;
+      const matchesTehsil = p.tehsil.toLowerCase().includes(q);
+      const matchesDistrict = p.district.toLowerCase().includes(q);
+      const matchesState = p.state.toLowerCase().includes(q);
+      if (!matchesId && !matchesOwner && !matchesKhasra && !matchesVillage && !matchesTehsil && !matchesDistrict && !matchesState) return false;
     }
 
     return true;
