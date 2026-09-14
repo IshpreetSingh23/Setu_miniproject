@@ -4,26 +4,37 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { Property, VerificationHistoryItem, VerificationResult, LandDocument } from '../types';
 import { DEMO_PROPERTIES, DEMO_HISTORY } from './demoFallback';
+import { calculateParcelAreaAcres } from '../gis/parcelArea';
 
 let serverSupabaseClient: SupabaseClient | null = null;
 
-// In-memory store for documents and history during demo/fallback execution
+// In-memory store for fallback execution when Supabase credentials are not provided
 const inMemoryHistory: VerificationHistoryItem[] = [...DEMO_HISTORY];
 const inMemoryDocuments: Map<string, LandDocument> = new Map();
+const inMemoryVerificationResults: Map<string, VerificationResult> = new Map();
 
 export function isSupabaseConfigured(): boolean {
-  return Boolean(
-    process.env.NEXT_PUBLIC_SUPABASE_URL &&
-    (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)
-  );
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+  return Boolean(url && key);
 }
 
 export function getServerSupabase(): SupabaseClient | null {
   if (!isSupabaseConfigured()) return null;
 
   if (!serverSupabaseClient) {
-    const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-    const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)!;
+    const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)!;
+    const key = (
+      process.env.SUPABASE_SERVICE_ROLE_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+      process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
+    )!;
+
     serverSupabaseClient = createClient(url, key, {
       auth: { persistSession: false },
     });
@@ -99,12 +110,16 @@ export async function getPropertyById(idOrPropId: string): Promise<Property | nu
 
   if (supabase) {
     try {
-      const { data, error } = await supabase
-        .from('properties')
-        .select('*')
-        .or(`property_id.eq.${idOrPropId},id.eq.${idOrPropId}`)
-        .single();
+      const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(idOrPropId);
+      let query = supabase.from('properties').select('*');
 
+      if (isUUID) {
+        query = query.or(`id.eq.${idOrPropId},property_id.eq.${idOrPropId}`);
+      } else {
+        query = query.or(`property_id.eq.${idOrPropId},khasra_number.eq.${idOrPropId}`);
+      }
+
+      const { data, error } = await query.single();
       if (!error && data) {
         return data as Property;
       }
@@ -122,6 +137,45 @@ export async function getPropertyById(idOrPropId: string): Promise<Property | nu
 }
 
 /**
+ * Computes parcel area using PostGIS RPC or fallback geodesic Shoelace
+ */
+export async function calculateParcelArea(geom: any): Promise<number> {
+  const supabase = getServerSupabase();
+  if (supabase && geom) {
+    try {
+      const { data, error } = await supabase.rpc('calculate_parcel_area_acres', { geom });
+      if (!error && data !== null && !isNaN(Number(data))) {
+        return Number(data);
+      }
+    } catch (err) {
+      console.warn('PostGIS area calculation error:', err);
+    }
+  }
+  return calculateParcelAreaAcres(geom);
+}
+
+/**
+ * Validates parcel geometry using PostGIS RPC
+ */
+export async function validateParcelGeometry(geom: any): Promise<{ valid: boolean; reason?: string }> {
+  const supabase = getServerSupabase();
+  if (supabase && geom) {
+    try {
+      const { data, error } = await supabase.rpc('validate_parcel_geometry', { geom });
+      if (!error && data) {
+        return data as { valid: boolean; reason?: string };
+      }
+    } catch (err) {
+      console.warn('PostGIS validate_parcel_geometry error:', err);
+    }
+  }
+  return {
+    valid: Boolean(geom && geom.type === 'Polygon' && geom.coordinates?.[0]?.length >= 3),
+    reason: 'Evaluated locally',
+  };
+}
+
+/**
  * Saves document metadata into Supabase or fallback memory
  */
 export async function saveDocument(doc: LandDocument): Promise<LandDocument> {
@@ -129,7 +183,32 @@ export async function saveDocument(doc: LandDocument): Promise<LandDocument> {
 
   if (supabase) {
     try {
-      const { data, error } = await supabase.from('documents').insert(doc).select().single();
+      let resolvedPropertyUuid: string | null = null;
+      if (doc.property_id) {
+        const prop = await getPropertyById(doc.property_id);
+        resolvedPropertyUuid = prop?.id || null;
+      }
+
+      const { data, error } = await supabase
+        .from('documents')
+        .insert({
+          id: doc.id.includes('-') && doc.id.length === 36 ? doc.id : undefined,
+          property_id: resolvedPropertyUuid,
+          file_name: doc.file_name,
+          file_path: doc.file_path,
+          mime_type: doc.mime_type,
+          file_size: doc.file_size,
+          document_type: doc.document_type,
+          ocr_status: doc.ocr_status,
+          ocr_provider: doc.ocr_provider,
+          ocr_confidence: doc.ocr_confidence,
+          raw_ocr_text: doc.raw_ocr_text,
+          extracted_fields: doc.extracted_fields,
+          uploaded_at: doc.uploaded_at || new Date().toISOString(),
+        })
+        .select()
+        .single();
+
       if (!error && data) {
         return data as LandDocument;
       }
@@ -165,30 +244,59 @@ export async function getDocumentById(id: string): Promise<LandDocument | null> 
 /**
  * Saves verification audit result
  */
-export async function saveVerificationResult(result: VerificationResult): Promise<void> {
+export async function saveVerificationResult(result: VerificationResult): Promise<string> {
   const supabase = getServerSupabase();
+  const generatedResultId = result.id || `res-${Date.now()}`;
+  result.id = generatedResultId;
 
   if (supabase) {
     try {
-      await supabase.from('verification_results').insert({
-        property_id: result.property_id,
-        document_id: result.document_id,
-        ownership_score: result.ownership_score,
-        khasra_score: result.khasra_score,
-        area_score: result.area_score,
-        registration_score: result.registration_score,
-        encumbrance_score: result.encumbrance_score,
-        court_score: result.court_score,
-        gis_score: result.gis_score,
-        total_score: result.total_score,
-        risk_level: result.risk_level,
-        mismatches: result.mismatches,
-        verification_details: result.factors,
-      });
+      const prop = await getPropertyById(result.property_id);
+      const propertyUuid = prop?.id || null;
+
+      let validDocumentUuid: string | null = null;
+      if (result.document_id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(result.document_id)) {
+        validDocumentUuid = result.document_id;
+      }
+
+      if (propertyUuid) {
+        const { data, error } = await supabase
+          .from('verification_results')
+          .insert({
+            property_id: propertyUuid,
+            document_id: validDocumentUuid,
+            ownership_score: result.ownership_score,
+            khasra_score: result.khasra_score,
+            area_score: result.area_score,
+            registration_score: result.registration_score,
+            encumbrance_score: result.encumbrance_score,
+            court_score: result.court_score,
+            gis_score: result.gis_score,
+            total_score: result.total_score,
+            risk_level: result.risk_level,
+            mismatches: result.mismatches,
+            verification_details: result.factors,
+          })
+          .select('id')
+          .single();
+
+        if (!error && data) {
+          result.id = data.id;
+          // Record in verification_history table
+          await supabase.from('verification_history').insert({
+            property_id: propertyUuid,
+            verification_result_id: data.id,
+          });
+        }
+      }
     } catch (err) {
       console.warn('Failed to insert verification result to Supabase:', err);
     }
   }
+
+  const finalId = result.id || generatedResultId;
+  result.id = finalId;
+  inMemoryVerificationResults.set(finalId, result);
 
   // Also record in verification history
   const historyItem: VerificationHistoryItem = {
@@ -203,6 +311,27 @@ export async function saveVerificationResult(result: VerificationResult): Promis
   };
 
   await saveHistoryItem(historyItem);
+  return result.id;
+}
+
+/**
+ * Retrieves verification result by ID
+ */
+export async function getVerificationResultById(id: string): Promise<VerificationResult | null> {
+  const supabase = getServerSupabase();
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.from('verification_results').select('*').eq('id', id).single();
+      if (!error && data) {
+        return data as VerificationResult;
+      }
+    } catch (err) {
+      console.warn('Failed to fetch verification result from Supabase:', err);
+    }
+  }
+
+  return inMemoryVerificationResults.get(id) || null;
 }
 
 /**
@@ -213,13 +342,35 @@ export async function getVerificationHistory(propertyId?: string): Promise<Verif
 
   if (supabase) {
     try {
-      let q = supabase.from('verification_history').select('*').order('created_at', { ascending: false });
-      if (propertyId) {
-        q = q.eq('property_id', propertyId);
-      }
+      let q = supabase
+        .from('verification_history')
+        .select(`
+          id,
+          created_at,
+          properties (
+            property_id,
+            owner_name
+          ),
+          verification_results (
+            total_score,
+            risk_level,
+            mismatches
+          )
+        `)
+        .order('created_at', { ascending: false });
+
       const { data, error } = await q.limit(50);
       if (!error && data && data.length > 0) {
-        return data as VerificationHistoryItem[];
+        return data.map((row: any) => ({
+          id: row.id,
+          property_id: row.properties?.property_id || 'PROP-001',
+          owner_name: row.properties?.owner_name || 'Verified Owner',
+          score: row.verification_results?.total_score ?? 100,
+          risk_level: row.verification_results?.risk_level || 'LOW',
+          status: (row.verification_results?.total_score ?? 100) >= 80 ? 'Verified' : 'Issues Found',
+          mismatches_count: row.verification_results?.mismatches?.length ?? 0,
+          run_date: new Date(row.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }),
+        }));
       }
     } catch (err) {
       console.warn('Failed to fetch verification history from Supabase:', err);
@@ -234,24 +385,6 @@ export async function getVerificationHistory(propertyId?: string): Promise<Verif
 }
 
 export async function saveHistoryItem(item: VerificationHistoryItem): Promise<void> {
-  const supabase = getServerSupabase();
-
-  if (supabase) {
-    try {
-      await supabase.from('verification_history').insert({
-        property_id: item.property_id,
-        owner_name: item.owner_name,
-        score: item.score,
-        risk_level: item.risk_level,
-        status: item.status,
-        mismatches_count: item.mismatches_count,
-        run_date: new Date().toISOString(),
-      });
-    } catch (err) {
-      console.warn('Failed to insert verification history into Supabase:', err);
-    }
-  }
-
   // Add to memory, deduplicating previous runs for same property
   const filtered = inMemoryHistory.filter((h) => h.property_id !== item.property_id);
   inMemoryHistory.length = 0;
